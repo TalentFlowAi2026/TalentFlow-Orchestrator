@@ -1,0 +1,81 @@
+name: Deploy TalentFlow Orchestrator
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AZURE_RESOURCE_GROUP: talentflow-orchestrator-prod-rg
+  ACR_NAME: talentflowai2026acr
+  ACR_LOGIN_SERVER: talentflowai2026acr.azurecr.io
+  IMAGE_REPOSITORY: talentflow-orchestrator
+  API_APP_NAME: talentflow-orchestrator-api
+  WORKER_APP_NAME: talentflow-orchestrator-worker
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login with OIDC
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build image in Azure Container Registry
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IMAGE_TAG="${GITHUB_SHA}"
+
+          az acr build             --registry "${ACR_NAME}"             --image "${IMAGE_REPOSITORY}:${IMAGE_TAG}"             .
+
+          echo "IMAGE=${ACR_LOGIN_SERVER}/${IMAGE_REPOSITORY}:${IMAGE_TAG}" >> "$GITHUB_ENV"
+
+      - name: Install Container Apps CLI extension
+        shell: bash
+        run: |
+          az extension add             --name containerapp             --upgrade             --yes
+
+      - name: Deploy API revision
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          az containerapp update             --name "${API_APP_NAME}"             --resource-group "${AZURE_RESOURCE_GROUP}"             --image "${IMAGE}"
+
+      - name: Deploy Worker revision
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          az containerapp update             --name "${WORKER_APP_NAME}"             --resource-group "${AZURE_RESOURCE_GROUP}"             --image "${IMAGE}"
+
+      - name: Verify API health
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for i in 1 2 3 4 5 6; do
+            if curl --fail --silent --show-error               https://orchestrator.talant-flow.app/health; then
+              echo
+              exit 0
+            fi
+
+            echo "Health check attempt ${i} failed; retrying..."
+            sleep 10
+          done
+
+          echo "API health check failed after deployment."
+          exit 1
