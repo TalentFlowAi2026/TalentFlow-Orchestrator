@@ -1,0 +1,1 @@
+"""Google production provider adapters."""

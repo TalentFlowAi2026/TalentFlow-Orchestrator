@@ -1,0 +1,13 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "namePrefix": { "value": "tf-orchestrator-prod" },
+    "containerImage": { "value": "example.azurecr.io/talentflow-orchestrator@sha256:replace" },
+    "keyVaultName": { "value": "talentflow-prod-kv" },
+    "supabaseUrl": { "value": "https://example.supabase.co" },
+    "publicInterviewBaseUrl": { "value": "https://app.example.com/interview" },
+    "googleOauthClientId": { "value": "replace.apps.googleusercontent.com" },
+    "googleOauthRedirectUri": { "value": "https://orchestrator.example.com/v1/integrations/google/callback" }
+  }
+}
