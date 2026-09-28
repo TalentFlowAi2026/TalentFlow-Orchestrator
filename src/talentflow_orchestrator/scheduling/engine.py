@@ -75,37 +75,76 @@ class SchedulingEngine:
             alternatives: list[datetime] = []
             rejected: dict[str, set[UUID]] = defaultdict(set)
 
-            for slot_start, slot_end, time_error in self._candidate_slots(request, policy):
-                if time_error is not None:
-                    rejected[time_error]
-                    continue
-                if slot_start is None or slot_end is None:
-                    continue
-                conflicts = self._conflicts(
-                    request=request,
-                    candidate_id=candidate_id,
-                    slot_start=slot_start,
-                    slot_end=slot_end,
-                    company_parallelism=company_parallelism,
-                    backend_parallelism=backend_parallelism,
-                    busy=[*busy, *allocated],
-                )
-                if conflicts:
-                    for code, reference_id in conflicts:
-                        if reference_id is not None:
-                            rejected[code].add(reference_id)
-                        else:
-                            rejected[code]
-                    continue
+            if request.mode == SchedulingMode.AUTO_BALANCED:
+                ranked_slots: list[tuple[int, int, datetime, datetime]] = []
+                current_busy = [*busy, *allocated]
+                for slot_start, slot_end, time_error in self._candidate_slots(request, policy):
+                    if time_error is not None:
+                        rejected[time_error]
+                        continue
+                    if slot_start is None or slot_end is None:
+                        continue
 
-                if chosen is None:
-                    chosen = (slot_start, slot_end)
-                    if request.mode == SchedulingMode.EXPLICIT:
+                    hard_conflicts = self._person_conflicts(
+                        request=request,
+                        candidate_id=candidate_id,
+                        slot_start=slot_start,
+                        slot_end=slot_end,
+                        busy=current_busy,
+                    )
+                    if hard_conflicts:
+                        for code, reference_id in hard_conflicts:
+                            if reference_id is not None:
+                                rejected[code].add(reference_id)
+                            else:
+                                rejected[code]
+                        continue
+
+                    company_load, backend_load = self._capacity_load(
+                        request=request,
+                        slot_start=slot_start,
+                        slot_end=slot_end,
+                        busy=current_busy,
+                    )
+                    ranked_slots.append((company_load, backend_load, slot_start, slot_end))
+
+                if ranked_slots:
+                    ranked_slots.sort(key=lambda item: (item[0], item[1], item[2]))
+                    _, _, start, end = ranked_slots[0]
+                    chosen = (start, end)
+                    alternatives = [item[2] for item in ranked_slots[1:4]]
+            else:
+                for slot_start, slot_end, time_error in self._candidate_slots(request, policy):
+                    if time_error is not None:
+                        rejected[time_error]
+                        continue
+                    if slot_start is None or slot_end is None:
+                        continue
+                    conflicts = self._conflicts(
+                        request=request,
+                        candidate_id=candidate_id,
+                        slot_start=slot_start,
+                        slot_end=slot_end,
+                        company_parallelism=company_parallelism,
+                        backend_parallelism=backend_parallelism,
+                        busy=[*busy, *allocated],
+                    )
+                    if conflicts:
+                        for code, reference_id in conflicts:
+                            if reference_id is not None:
+                                rejected[code].add(reference_id)
+                            else:
+                                rejected[code]
+                        continue
+
+                    if chosen is None:
+                        chosen = (slot_start, slot_end)
+                        if request.mode == SchedulingMode.EXPLICIT:
+                            break
+                    elif len(alternatives) < 3:
+                        alternatives.append(slot_start)
+                    if len(alternatives) == 3:
                         break
-                elif len(alternatives) < 3:
-                    alternatives.append(slot_start)
-                if len(alternatives) == 3:
-                    break
 
             if chosen is None:
                 if request.mode == SchedulingMode.EXPLICIT:
@@ -351,6 +390,51 @@ class SchedulingEngine:
             else:
                 free.append(FreeInterval(start=slot_start, end=slot_end))
         return free
+
+    def _person_conflicts(
+        self,
+        *,
+        request: SchedulingRequest,
+        candidate_id: UUID,
+        slot_start: datetime,
+        slot_end: datetime,
+        busy: list[BusyInterval],
+    ) -> list[tuple[str, UUID | None]]:
+        """Hard conflicts that can never be solved by adding parallel capacity."""
+        conflicts: list[tuple[str, UUID | None]] = []
+        for interval in busy:
+            if interval.kind == BusyKind.CANDIDATE and interval.owner_id == candidate_id:
+                if self._buffered_overlap(request, slot_start, slot_end, interval):
+                    conflicts.append(("candidate_conflict", interval.reference_id))
+            elif interval.kind in {BusyKind.INTERVIEWER, BusyKind.CALENDAR}:
+                if interval.owner_id in request.interviewer_ids and self._buffered_overlap(
+                    request, slot_start, slot_end, interval
+                ):
+                    conflicts.append(("interviewer_conflict", interval.reference_id))
+        return conflicts
+
+    def _capacity_load(
+        self,
+        *,
+        request: SchedulingRequest,
+        slot_start: datetime,
+        slot_end: datetime,
+        busy: list[BusyInterval],
+    ) -> tuple[int, int]:
+        """Return current company/backend overlap load for soft load-balanced scheduling."""
+        company_capacity: list[BusyInterval] = []
+        backend_capacity: list[BusyInterval] = []
+        for interval in busy:
+            if interval.kind != BusyKind.CAPACITY:
+                continue
+            if interval.source in {"company_capacity", "talentflow"}:
+                company_capacity.append(interval)
+            if interval.source in {"backend_capacity", "talentflow"}:
+                backend_capacity.append(interval)
+        return (
+            self._peak_capacity(request, slot_start, slot_end, company_capacity),
+            self._peak_capacity(request, slot_start, slot_end, backend_capacity),
+        )
 
     def _conflicts(
         self,

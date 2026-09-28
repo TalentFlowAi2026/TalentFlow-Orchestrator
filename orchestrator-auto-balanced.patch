@@ -1,0 +1,351 @@
+diff --git a/.env.example b/.env.example
+index 180b427..89e9ec9 100644
+--- a/.env.example
++++ b/.env.example
+@@ -28,8 +28,8 @@ PROPOSAL_EXPIRY_MINUTES=30
+ MAX_SCHEDULING_HORIZON_DAYS=31
+ BACKEND_MAX_PARALLEL_AI_INTERVIEWS=1
+ # Application-level local-time range used only when HR supplies a date with no window.
+-DEFAULT_INTERVIEW_DAY_START=09:00
+-DEFAULT_INTERVIEW_DAY_END=18:00
++DEFAULT_INTERVIEW_DAY_START=07:00
++DEFAULT_INTERVIEW_DAY_END=17:00
+ MAX_REQUEST_BYTES=32768
+ API_REQUESTS_PER_MINUTE=60
+ 
+diff --git a/README.md b/README.md
+index b684bb9..6f83567 100644
+--- a/README.md
++++ b/README.md
+@@ -21,7 +21,7 @@ Copy `.env.example` to an untracked `.env`. Required for both processes:
+ 
+ The API additionally requires `SUPABASE_URL`; `SUPABASE_PUBLISHABLE_KEY` is required only when `SUPABASE_AUTH_MODE=user_endpoint`. Google client ID, secret, redirect URI, and encryption key are mandatory when Calendar or Gmail is enabled. `GOOGLE_API_KEY` enables Gemini intent parsing; scheduling itself remains deterministic when intent parsing is unavailable.
+ 
+-Date-only requests use the configurable application-level `DEFAULT_INTERVIEW_DAY_START` and `DEFAULT_INTERVIEW_DAY_END` local-time range (09:00–18:00 by default). Exact times and HR-provided windows take precedence. Company policy is read from the existing `companies.settings.scheduling` JSON object and supports `timezone`, `allow_parallel_ai_interviews`, `max_parallel_ai_interviews`, `default_duration_minutes`, `default_buffer_minutes`, `slot_increment_minutes`, and `allowed_weekdays`. Existing per-weekday `working_hours` can remain as an additional constraint only when `enforce_working_hours` is explicitly true; they are never required for date-only scheduling. Backend capacity is independently capped by `BACKEND_MAX_PARALLEL_AI_INTERVIEWS`.
++Date-only requests use the configurable application-level `DEFAULT_INTERVIEW_DAY_START` and `DEFAULT_INTERVIEW_DAY_END` local-time range (07:00–17:00 by default). Exact times and HR-provided windows take precedence. Company policy is read from the existing `companies.settings.scheduling` JSON object and supports `timezone`, `allow_parallel_ai_interviews`, `max_parallel_ai_interviews`, `default_duration_minutes`, `default_buffer_minutes`, `slot_increment_minutes`, and `allowed_weekdays`. Existing per-weekday `working_hours` can remain as an additional constraint only when `enforce_working_hours` is explicitly true; they are never required for date-only scheduling. Backend capacity is independently capped by `BACKEND_MAX_PARALLEL_AI_INTERVIEWS`.
+ 
+ The existing schema has no first-time application/intake domain. This migration backfills company-visible candidates from canonical interview history, and the assignment endpoint can reuse only an already visible candidate. A future applicant/invitation workflow must establish the first company/candidate relationship; the orchestrator deliberately cannot claim arbitrary global profile IDs.
+ 
+diff --git a/src/talentflow_orchestrator/config/settings.py b/src/talentflow_orchestrator/config/settings.py
+index 826c970..748f4c0 100644
+--- a/src/talentflow_orchestrator/config/settings.py
++++ b/src/talentflow_orchestrator/config/settings.py
+@@ -43,8 +43,8 @@ class Settings(BaseSettings):
+     proposal_expiry_minutes: int = Field(default=30, ge=5, le=1440)
+     max_scheduling_horizon_days: int = Field(default=31, ge=1, le=92)
+     backend_max_parallel_ai_interviews: int = Field(default=1, ge=1, le=100)
+-    default_interview_day_start: time = time(9)
+-    default_interview_day_end: time = time(18)
++    default_interview_day_start: time = time(7)
++    default_interview_day_end: time = time(17)
+     max_request_bytes: int = Field(default=32768, ge=4096, le=131072)
+     api_requests_per_minute: int = Field(default=60, ge=1, le=600)
+     public_interview_base_url: str = "http://localhost:3000/interview"
+diff --git a/src/talentflow_orchestrator/scheduling/engine.py b/src/talentflow_orchestrator/scheduling/engine.py
+index ab57569..3a29dca 100644
+--- a/src/talentflow_orchestrator/scheduling/engine.py
++++ b/src/talentflow_orchestrator/scheduling/engine.py
+@@ -75,37 +75,76 @@ class SchedulingEngine:
+             alternatives: list[datetime] = []
+             rejected: dict[str, set[UUID]] = defaultdict(set)
+ 
+-            for slot_start, slot_end, time_error in self._candidate_slots(request, policy):
+-                if time_error is not None:
+-                    rejected[time_error]
+-                    continue
+-                if slot_start is None or slot_end is None:
+-                    continue
+-                conflicts = self._conflicts(
+-                    request=request,
+-                    candidate_id=candidate_id,
+-                    slot_start=slot_start,
+-                    slot_end=slot_end,
+-                    company_parallelism=company_parallelism,
+-                    backend_parallelism=backend_parallelism,
+-                    busy=[*busy, *allocated],
+-                )
+-                if conflicts:
+-                    for code, reference_id in conflicts:
+-                        if reference_id is not None:
+-                            rejected[code].add(reference_id)
+-                        else:
+-                            rejected[code]
+-                    continue
+-
+-                if chosen is None:
+-                    chosen = (slot_start, slot_end)
+-                    if request.mode == SchedulingMode.EXPLICIT:
++            if request.mode == SchedulingMode.AUTO_BALANCED:
++                ranked_slots: list[tuple[int, int, datetime, datetime]] = []
++                current_busy = [*busy, *allocated]
++                for slot_start, slot_end, time_error in self._candidate_slots(request, policy):
++                    if time_error is not None:
++                        rejected[time_error]
++                        continue
++                    if slot_start is None or slot_end is None:
++                        continue
++
++                    hard_conflicts = self._person_conflicts(
++                        request=request,
++                        candidate_id=candidate_id,
++                        slot_start=slot_start,
++                        slot_end=slot_end,
++                        busy=current_busy,
++                    )
++                    if hard_conflicts:
++                        for code, reference_id in hard_conflicts:
++                            if reference_id is not None:
++                                rejected[code].add(reference_id)
++                            else:
++                                rejected[code]
++                        continue
++
++                    company_load, backend_load = self._capacity_load(
++                        request=request,
++                        slot_start=slot_start,
++                        slot_end=slot_end,
++                        busy=current_busy,
++                    )
++                    ranked_slots.append((company_load, backend_load, slot_start, slot_end))
++
++                if ranked_slots:
++                    ranked_slots.sort(key=lambda item: (item[0], item[1], item[2]))
++                    _, _, start, end = ranked_slots[0]
++                    chosen = (start, end)
++                    alternatives = [item[2] for item in ranked_slots[1:4]]
++            else:
++                for slot_start, slot_end, time_error in self._candidate_slots(request, policy):
++                    if time_error is not None:
++                        rejected[time_error]
++                        continue
++                    if slot_start is None or slot_end is None:
++                        continue
++                    conflicts = self._conflicts(
++                        request=request,
++                        candidate_id=candidate_id,
++                        slot_start=slot_start,
++                        slot_end=slot_end,
++                        company_parallelism=company_parallelism,
++                        backend_parallelism=backend_parallelism,
++                        busy=[*busy, *allocated],
++                    )
++                    if conflicts:
++                        for code, reference_id in conflicts:
++                            if reference_id is not None:
++                                rejected[code].add(reference_id)
++                            else:
++                                rejected[code]
++                        continue
++
++                    if chosen is None:
++                        chosen = (slot_start, slot_end)
++                        if request.mode == SchedulingMode.EXPLICIT:
++                            break
++                    elif len(alternatives) < 3:
++                        alternatives.append(slot_start)
++                    if len(alternatives) == 3:
+                         break
+-                elif len(alternatives) < 3:
+-                    alternatives.append(slot_start)
+-                if len(alternatives) == 3:
+-                    break
+ 
+             if chosen is None:
+                 if request.mode == SchedulingMode.EXPLICIT:
+@@ -352,6 +391,51 @@ class SchedulingEngine:
+                 free.append(FreeInterval(start=slot_start, end=slot_end))
+         return free
+ 
++    def _person_conflicts(
++        self,
++        *,
++        request: SchedulingRequest,
++        candidate_id: UUID,
++        slot_start: datetime,
++        slot_end: datetime,
++        busy: list[BusyInterval],
++    ) -> list[tuple[str, UUID | None]]:
++        """Hard conflicts that can never be solved by adding parallel capacity."""
++        conflicts: list[tuple[str, UUID | None]] = []
++        for interval in busy:
++            if interval.kind == BusyKind.CANDIDATE and interval.owner_id == candidate_id:
++                if self._buffered_overlap(request, slot_start, slot_end, interval):
++                    conflicts.append(("candidate_conflict", interval.reference_id))
++            elif interval.kind in {BusyKind.INTERVIEWER, BusyKind.CALENDAR}:
++                if interval.owner_id in request.interviewer_ids and self._buffered_overlap(
++                    request, slot_start, slot_end, interval
++                ):
++                    conflicts.append(("interviewer_conflict", interval.reference_id))
++        return conflicts
++
++    def _capacity_load(
++        self,
++        *,
++        request: SchedulingRequest,
++        slot_start: datetime,
++        slot_end: datetime,
++        busy: list[BusyInterval],
++    ) -> tuple[int, int]:
++        """Return current company/backend overlap load for soft load-balanced scheduling."""
++        company_capacity: list[BusyInterval] = []
++        backend_capacity: list[BusyInterval] = []
++        for interval in busy:
++            if interval.kind != BusyKind.CAPACITY:
++                continue
++            if interval.source in {"company_capacity", "talentflow"}:
++                company_capacity.append(interval)
++            if interval.source in {"backend_capacity", "talentflow"}:
++                backend_capacity.append(interval)
++        return (
++            self._peak_capacity(request, slot_start, slot_end, company_capacity),
++            self._peak_capacity(request, slot_start, slot_end, backend_capacity),
++        )
++
+     def _conflicts(
+         self,
+         *,
+diff --git a/src/talentflow_orchestrator/scheduling/models.py b/src/talentflow_orchestrator/scheduling/models.py
+index f402b89..f8970f2 100644
+--- a/src/talentflow_orchestrator/scheduling/models.py
++++ b/src/talentflow_orchestrator/scheduling/models.py
+@@ -16,6 +16,7 @@ from talentflow_orchestrator.domain.models import Model
+ class SchedulingMode(StrEnum):
+     EXPLICIT = "explicit"
+     AI_ASSISTED = "ai_assisted"
++    AUTO_BALANCED = "auto_balanced"
+ 
+ 
+ class BusyKind(StrEnum):
+@@ -39,9 +40,9 @@ class DailyWorkingHours(Model):
+ class SchedulingPolicy(Model):
+     max_parallel_ai_interviews: int = Field(ge=1, le=100)
+     backend_max_parallel_ai_interviews: int = Field(ge=1, le=100)
+-    slot_increment_minutes: int = Field(default=5, ge=1, le=60)
+-    default_interview_day_start: time = time(9)
+-    default_interview_day_end: time = time(18)
++    slot_increment_minutes: int = Field(default=15, ge=1, le=60)
++    default_interview_day_start: time = time(7)
++    default_interview_day_end: time = time(17)
+     allowed_weekdays: list[int] = Field(default_factory=lambda: list(range(7)), min_length=1)
+     working_hours: dict[int, DailyWorkingHours] = Field(default_factory=dict)
+     enforce_working_hours: bool = False
+@@ -82,7 +83,7 @@ class CompanySchedulingSettings(Model):
+     max_parallel_ai_interviews: int = Field(default=1, ge=1, le=100)
+     default_duration_minutes: int | None = Field(default=None, ge=5, le=180)
+     default_buffer_minutes: int = Field(default=0, ge=0, le=120)
+-    slot_increment_minutes: int = Field(default=5, ge=1, le=60)
++    slot_increment_minutes: int = Field(default=15, ge=1, le=60)
+     allowed_weekdays: list[int] = Field(default_factory=lambda: list(range(7)), min_length=1)
+     working_hours: dict[int, DailyWorkingHours] = Field(default_factory=dict)
+     enforce_working_hours: bool = False
+@@ -195,6 +196,8 @@ class SchedulingRequest(Model):
+             ).total_seconds() / 60
+             if window_minutes != self.duration_minutes:
+                 raise ValueError("explicit scheduling window must equal duration_minutes")
++        if self.mode == SchedulingMode.AUTO_BALANCED and self.start_date != self.end_date:
++            raise ValueError("auto-balanced scheduling requires a single date")
+         return self
+ 
+ 
+diff --git a/tests/unit/test_scheduling_engine.py b/tests/unit/test_scheduling_engine.py
+index 25a4322..16f4282 100644
+--- a/tests/unit/test_scheduling_engine.py
++++ b/tests/unit/test_scheduling_engine.py
+@@ -682,3 +682,97 @@ def test_required_date_only_acceptance_scenario() -> None:
+             and conflict.start - timedelta(minutes=10) < item.proposed_end
+             for conflict in conflicts
+         )
++
++
++def test_auto_balanced_prefers_empty_time_before_parallel_overlap() -> None:
++    candidate = uuid4()
++    request = request_for(
++        [candidate],
++        mode=SchedulingMode.AUTO_BALANCED,
++        start=time(7),
++        end=time(17),
++        duration=30,
++        buffer=0,
++    )
++    zone = ZoneInfo("Asia/Gaza")
++    busy = [
++        BusyInterval(
++            start=datetime(2026, 10, 1, 7, 0, tzinfo=zone).astimezone(UTC),
++            end=datetime(2026, 10, 1, 7, 30, tzinfo=zone).astimezone(UTC),
++            kind=BusyKind.CAPACITY,
++            source="company_capacity",
++        ),
++        BusyInterval(
++            start=datetime(2026, 10, 1, 7, 0, tzinfo=zone).astimezone(UTC),
++            end=datetime(2026, 10, 1, 7, 30, tzinfo=zone).astimezone(UTC),
++            kind=BusyKind.CAPACITY,
++            source="backend_capacity",
++        ),
++    ]
++
++    item = SchedulingEngine().propose(
++        request,
++        policy(max_parallel=1, increment=15, default_start=time(7), default_end=time(17)),
++        busy,
++    ).items[0]
++
++    assert item.proposed_start == datetime(2026, 10, 1, 7, 30, tzinfo=zone).astimezone(UTC)
++
++
++def test_auto_balanced_allows_second_parallel_interview_when_day_is_fully_occupied() -> None:
++    candidate = uuid4()
++    request = request_for(
++        [candidate],
++        mode=SchedulingMode.AUTO_BALANCED,
++        start=time(7),
++        end=time(8),
++        duration=30,
++        buffer=0,
++    )
++    zone = ZoneInfo("Asia/Gaza")
++    busy: list[BusyInterval] = []
++    for hour, minute in [(7, 0), (7, 30)]:
++        start = datetime(2026, 10, 1, hour, minute, tzinfo=zone).astimezone(UTC)
++        end = start + timedelta(minutes=30)
++        busy.extend(
++            [
++                BusyInterval(start=start, end=end, kind=BusyKind.CAPACITY, source="company_capacity"),
++                BusyInterval(start=start, end=end, kind=BusyKind.CAPACITY, source="backend_capacity"),
++            ]
++        )
++
++    item = SchedulingEngine().propose(
++        request,
++        policy(max_parallel=1, increment=15, default_start=time(7), default_end=time(17)),
++        busy,
++    ).items[0]
++
++    assert item.proposed_start == datetime(2026, 10, 1, 7, 0, tzinfo=zone).astimezone(UTC)
++
++
++def test_auto_balanced_uses_fifteen_minute_candidates_and_real_duration() -> None:
++    candidate = uuid4()
++    request = request_for(
++        [candidate],
++        mode=SchedulingMode.AUTO_BALANCED,
++        start=time(9),
++        end=time(11),
++        duration=30,
++        buffer=0,
++    )
++    zone = ZoneInfo("Asia/Gaza")
++    occupied_start = datetime(2026, 10, 1, 9, 0, tzinfo=zone).astimezone(UTC)
++    occupied_end = datetime(2026, 10, 1, 10, 30, tzinfo=zone).astimezone(UTC)
++    busy = [
++        BusyInterval(start=occupied_start, end=occupied_end, kind=BusyKind.CAPACITY, source="company_capacity"),
++        BusyInterval(start=occupied_start, end=occupied_end, kind=BusyKind.CAPACITY, source="backend_capacity"),
++    ]
++
++    item = SchedulingEngine().propose(
++        request,
++        policy(max_parallel=1, increment=15, default_start=time(7), default_end=time(17)),
++        busy,
++    ).items[0]
++
++    assert item.proposed_start == datetime(2026, 10, 1, 10, 30, tzinfo=zone).astimezone(UTC)
++    assert item.proposed_end == datetime(2026, 10, 1, 11, 0, tzinfo=zone).astimezone(UTC)

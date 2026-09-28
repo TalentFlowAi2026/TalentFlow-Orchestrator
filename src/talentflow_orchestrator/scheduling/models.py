@@ -16,6 +16,7 @@ from talentflow_orchestrator.domain.models import Model
 class SchedulingMode(StrEnum):
     EXPLICIT = "explicit"
     AI_ASSISTED = "ai_assisted"
+    AUTO_BALANCED = "auto_balanced"
 
 
 class BusyKind(StrEnum):
@@ -39,9 +40,9 @@ class DailyWorkingHours(Model):
 class SchedulingPolicy(Model):
     max_parallel_ai_interviews: int = Field(ge=1, le=100)
     backend_max_parallel_ai_interviews: int = Field(ge=1, le=100)
-    slot_increment_minutes: int = Field(default=5, ge=1, le=60)
-    default_interview_day_start: time = time(9)
-    default_interview_day_end: time = time(18)
+    slot_increment_minutes: int = Field(default=15, ge=1, le=60)
+    default_interview_day_start: time = time(7)
+    default_interview_day_end: time = time(17)
     allowed_weekdays: list[int] = Field(default_factory=lambda: list(range(7)), min_length=1)
     working_hours: dict[int, DailyWorkingHours] = Field(default_factory=dict)
     enforce_working_hours: bool = False
@@ -82,7 +83,7 @@ class CompanySchedulingSettings(Model):
     max_parallel_ai_interviews: int = Field(default=1, ge=1, le=100)
     default_duration_minutes: int | None = Field(default=None, ge=5, le=180)
     default_buffer_minutes: int = Field(default=0, ge=0, le=120)
-    slot_increment_minutes: int = Field(default=5, ge=1, le=60)
+    slot_increment_minutes: int = Field(default=15, ge=1, le=60)
     allowed_weekdays: list[int] = Field(default_factory=lambda: list(range(7)), min_length=1)
     working_hours: dict[int, DailyWorkingHours] = Field(default_factory=dict)
     enforce_working_hours: bool = False
@@ -195,6 +196,8 @@ class SchedulingRequest(Model):
             ).total_seconds() / 60
             if window_minutes != self.duration_minutes:
                 raise ValueError("explicit scheduling window must equal duration_minutes")
+        if self.mode == SchedulingMode.AUTO_BALANCED and self.start_date != self.end_date:
+            raise ValueError("auto-balanced scheduling requires a single date")
         return self
 
 

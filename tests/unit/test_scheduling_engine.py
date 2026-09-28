@@ -682,3 +682,97 @@ def test_required_date_only_acceptance_scenario() -> None:
             and conflict.start - timedelta(minutes=10) < item.proposed_end
             for conflict in conflicts
         )
+
+
+def test_auto_balanced_prefers_empty_time_before_parallel_overlap() -> None:
+    candidate = uuid4()
+    request = request_for(
+        [candidate],
+        mode=SchedulingMode.AUTO_BALANCED,
+        start=time(7),
+        end=time(17),
+        duration=30,
+        buffer=0,
+    )
+    zone = ZoneInfo("Asia/Gaza")
+    busy = [
+        BusyInterval(
+            start=datetime(2026, 10, 1, 7, 0, tzinfo=zone).astimezone(UTC),
+            end=datetime(2026, 10, 1, 7, 30, tzinfo=zone).astimezone(UTC),
+            kind=BusyKind.CAPACITY,
+            source="company_capacity",
+        ),
+        BusyInterval(
+            start=datetime(2026, 10, 1, 7, 0, tzinfo=zone).astimezone(UTC),
+            end=datetime(2026, 10, 1, 7, 30, tzinfo=zone).astimezone(UTC),
+            kind=BusyKind.CAPACITY,
+            source="backend_capacity",
+        ),
+    ]
+
+    item = SchedulingEngine().propose(
+        request,
+        policy(max_parallel=1, increment=15, default_start=time(7), default_end=time(17)),
+        busy,
+    ).items[0]
+
+    assert item.proposed_start == datetime(2026, 10, 1, 7, 30, tzinfo=zone).astimezone(UTC)
+
+
+def test_auto_balanced_allows_second_parallel_interview_when_day_is_fully_occupied() -> None:
+    candidate = uuid4()
+    request = request_for(
+        [candidate],
+        mode=SchedulingMode.AUTO_BALANCED,
+        start=time(7),
+        end=time(8),
+        duration=30,
+        buffer=0,
+    )
+    zone = ZoneInfo("Asia/Gaza")
+    busy: list[BusyInterval] = []
+    for hour, minute in [(7, 0), (7, 30)]:
+        start = datetime(2026, 10, 1, hour, minute, tzinfo=zone).astimezone(UTC)
+        end = start + timedelta(minutes=30)
+        busy.extend(
+            [
+                BusyInterval(start=start, end=end, kind=BusyKind.CAPACITY, source="company_capacity"),
+                BusyInterval(start=start, end=end, kind=BusyKind.CAPACITY, source="backend_capacity"),
+            ]
+        )
+
+    item = SchedulingEngine().propose(
+        request,
+        policy(max_parallel=1, increment=15, default_start=time(7), default_end=time(17)),
+        busy,
+    ).items[0]
+
+    assert item.proposed_start == datetime(2026, 10, 1, 7, 0, tzinfo=zone).astimezone(UTC)
+
+
+def test_auto_balanced_uses_fifteen_minute_candidates_and_real_duration() -> None:
+    candidate = uuid4()
+    request = request_for(
+        [candidate],
+        mode=SchedulingMode.AUTO_BALANCED,
+        start=time(9),
+        end=time(11),
+        duration=30,
+        buffer=0,
+    )
+    zone = ZoneInfo("Asia/Gaza")
+    occupied_start = datetime(2026, 10, 1, 9, 0, tzinfo=zone).astimezone(UTC)
+    occupied_end = datetime(2026, 10, 1, 10, 30, tzinfo=zone).astimezone(UTC)
+    busy = [
+        BusyInterval(start=occupied_start, end=occupied_end, kind=BusyKind.CAPACITY, source="company_capacity"),
+        BusyInterval(start=occupied_start, end=occupied_end, kind=BusyKind.CAPACITY, source="backend_capacity"),
+    ]
+
+    item = SchedulingEngine().propose(
+        request,
+        policy(max_parallel=1, increment=15, default_start=time(7), default_end=time(17)),
+        busy,
+    ).items[0]
+
+    assert item.proposed_start == datetime(2026, 10, 1, 10, 30, tzinfo=zone).astimezone(UTC)
+    assert item.proposed_end == datetime(2026, 10, 1, 11, 0, tzinfo=zone).astimezone(UTC)

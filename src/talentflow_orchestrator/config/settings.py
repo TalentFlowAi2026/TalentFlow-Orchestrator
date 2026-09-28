@@ -43,8 +43,8 @@ class Settings(BaseSettings):
     proposal_expiry_minutes: int = Field(default=30, ge=5, le=1440)
     max_scheduling_horizon_days: int = Field(default=31, ge=1, le=92)
     backend_max_parallel_ai_interviews: int = Field(default=1, ge=1, le=100)
-    default_interview_day_start: time = time(9)
-    default_interview_day_end: time = time(18)
+    default_interview_day_start: time = time(7)
+    default_interview_day_end: time = time(17)
     max_request_bytes: int = Field(default=32768, ge=4096, le=131072)
     api_requests_per_minute: int = Field(default=60, ge=1, le=600)
     public_interview_base_url: str = "http://localhost:3000/interview"
