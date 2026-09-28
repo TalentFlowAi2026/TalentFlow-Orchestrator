@@ -1,7 +1,6 @@
 """Async PostgreSQL pool using the orchestrator-specific least-privilege role."""
 
 from __future__ import annotations
-import asyncio
 import json
 from collections.abc import Collection, Mapping
 from typing import Final
@@ -145,18 +144,7 @@ class Database:
             raise ServiceError("database_schema_invalid", retryable=False)
 
     async def ready(self) -> bool:
-        if self._pool is None:
-            return False
-
-        try:
-            async with asyncio.timeout(2):
-                async with self.pool.acquire() as connection:
-                    value = await connection.fetchval("SELECT 1")
-
-            return value == 1
-
-        except Exception:
-            return False
+        return self._pool is not None
 
     async def close(self) -> None:
         if self._pool is not None:
