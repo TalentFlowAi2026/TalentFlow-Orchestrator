@@ -118,35 +118,23 @@ class GeminiIntentProvider:
                 self.settings
                 .gemini_intent_timeout_seconds
             ):
-                response = (
-                    await self.client
-                    .aio
-                    .interactions
-                    .create(
-                        model=(
-                            self.settings
-                            .gemini_scheduling_model
-                        ),
-                        input=prompt,
-                        response_format={
-                            "type": "text",
-                            "mime_type": (
-                                "application/json"
-                            ),
-                            "schema": (
-                                _response_schema()
-                            ),
-                        },
-                        timeout=(
-                            self.settings
-                            .gemini_intent_timeout_seconds
-                        ),
-                    )
+               response = (
+                await self.client
+                .aio
+                .models
+                .generate_content(
+                    model=self.settings.gemini_scheduling_model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=_response_schema(),
+                    ),
                 )
+            )
 
             output = getattr(
                 response,
-                "output_text",
+                "text",
                 None,
             )
 
