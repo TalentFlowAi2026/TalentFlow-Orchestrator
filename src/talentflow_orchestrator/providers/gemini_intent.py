@@ -165,13 +165,11 @@ class GeminiIntentProvider:
 
         except TimeoutError as exc:
             logger.warning(
-                "gemini_intent_timeout",
-                extra={
-                    "error_type": (
-                        type(exc).__name__
-                    ),
-                    "error_message": str(exc),
-                },
+                "gemini_intent_timeout "
+                "error_type=%s "
+                "error_message=%s",
+                type(exc).__name__,
+                str(exc).replace("\n", " ").strip()[:2000],
             )
 
             raise ServiceError(
@@ -215,17 +213,20 @@ class GeminiIntentProvider:
                 else status_code
             )
 
+            error_message = (
+                str(exc)
+                .replace("\n", " ")
+                .strip()
+            )
+
             logger.warning(
-                "gemini_intent_provider_error",
-                extra={
-                    "status_code": (
-                        effective_code
-                    ),
-                    "error_type": (
-                        type(exc).__name__
-                    ),
-                    "error_message": str(exc),
-                },
+                "gemini_intent_provider_error "
+                "status_code=%s "
+                "error_type=%s "
+                "error_message=%s",
+                effective_code,
+                type(exc).__name__,
+                error_message[:2000],
             )
 
             if isinstance(
