@@ -581,7 +581,7 @@ class SchedulingRepository:
                     "proposed" if item.schedulable else "conflict",
                     item.warnings,
                     [entry.model_dump(mode="json") for entry in item.conflicts],
-                    item.alternatives,
+                    [value.isoformat() for value in item.alternatives],
                 )
             await self._event(
                 conn,
