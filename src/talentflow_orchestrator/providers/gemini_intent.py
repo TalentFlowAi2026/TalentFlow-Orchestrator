@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 from datetime import date
 from typing import Any
 
@@ -118,19 +119,9 @@ class GeminiIntentProvider:
                 self.settings
                 .gemini_intent_timeout_seconds
             ):
-               response = (
-                await self.client
-                .aio
-                .models
-                .generate_content(
-                    model=self.settings.gemini_scheduling_model,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_schema=_response_schema(),
-                    ),
+                response = await self._generate_with_retry(
+                    prompt
                 )
-            )
 
             output = getattr(
                 response,
@@ -157,7 +148,9 @@ class GeminiIntentProvider:
                 "error_type=%s "
                 "error_message=%s",
                 type(exc).__name__,
-                str(exc).replace("\n", " ").strip()[:2000],
+                str(exc)
+                .replace("\n", " ")
+                .strip()[:2000],
             )
 
             raise ServiceError(
@@ -250,6 +243,123 @@ class GeminiIntentProvider:
                 status=503,
                 retryable=False,
             ) from exc
+
+    async def _generate_with_retry(
+        self,
+        prompt: str,
+    ) -> Any:
+        if self.client is None:
+            raise ServiceError(
+                "intent_provider_not_configured",
+                retryable=False,
+            )
+
+        max_attempts = 3
+
+        for attempt in range(
+            1,
+            max_attempts + 1,
+        ):
+            try:
+                return (
+                    await self.client
+                    .aio
+                    .models
+                    .generate_content(
+                        model=(
+                            self.settings
+                            .gemini_scheduling_model
+                        ),
+                        contents=prompt,
+                        config=types.GenerateContentConfig(
+                            response_mime_type=(
+                                "application/json"
+                            ),
+                            response_schema=(
+                                _response_schema()
+                            ),
+                        ),
+                    )
+                )
+
+            except Exception as exc:
+                code = getattr(
+                    exc,
+                    "code",
+                    None,
+                )
+
+                status_code = getattr(
+                    exc,
+                    "status_code",
+                    None,
+                )
+
+                if status_code is None:
+                    response = getattr(
+                        exc,
+                        "response",
+                        None,
+                    )
+
+                    status_code = getattr(
+                        response,
+                        "status_code",
+                        None,
+                    )
+
+                effective_code = (
+                    code
+                    if isinstance(code, int)
+                    else status_code
+                )
+
+                retryable = (
+                    effective_code == 429
+                    or (
+                        isinstance(
+                            effective_code,
+                            int,
+                        )
+                        and effective_code >= 500
+                    )
+                )
+
+                if (
+                    not retryable
+                    or attempt >= max_attempts
+                ):
+                    raise
+
+                delay = (
+                    2 ** (attempt - 1)
+                ) + random.uniform(
+                    0.0,
+                    0.5,
+                )
+
+                logger.warning(
+                    "gemini_intent_retry "
+                    "attempt=%s "
+                    "max_attempts=%s "
+                    "status_code=%s "
+                    "delay_seconds=%.2f "
+                    "error_type=%s",
+                    attempt,
+                    max_attempts,
+                    effective_code,
+                    delay,
+                    type(exc).__name__,
+                )
+
+                await asyncio.sleep(
+                    delay
+                )
+
+        raise RuntimeError(
+            "Gemini retry loop completed "
+            "without returning a response"
+        )
 
     def _prompt(
         self,
