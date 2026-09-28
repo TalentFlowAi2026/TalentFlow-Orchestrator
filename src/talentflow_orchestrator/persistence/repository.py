@@ -131,6 +131,85 @@ class SchedulingRepository:
         async with self.db.pool.acquire() as conn:
             await self._validate_scope(conn, actor, request)
 
+    async def resolve_job_posting_for_role(
+        self,
+        *,
+        actor: Actor,
+        job_role_id: UUID,
+        candidate_id: UUID,
+    ) -> UUID:
+        """Resolve the newest company posting for a role and ensure candidate assignment."""
+        async with self.db.pool.acquire() as conn, conn.transaction():
+            await self._require_scheduling_manager(conn, actor.user_id, actor.company_id)
+            role_exists = await conn.fetchval(
+                """
+                SELECT EXISTS(
+                  SELECT 1 FROM job_roles
+                  WHERE id=$1 AND (company_id IS NULL OR company_id=$2) AND is_active=true
+                )
+                """,
+                job_role_id,
+                actor.company_id,
+            )
+            if not role_exists:
+                raise ServiceError("job_role_not_found", status=404, retryable=False)
+
+            job_id = await conn.fetchval(
+                """
+                SELECT id
+                FROM job_postings
+                WHERE company_id=$1 AND job_role_id=$2 AND status<>'archived'
+                ORDER BY created_at DESC,id DESC
+                LIMIT 1
+                """,
+                actor.company_id,
+                job_role_id,
+            )
+            if job_id is None:
+                raise ServiceError("position_not_found", status=404, retryable=False)
+
+            candidate_exists = await conn.fetchval(
+                """
+                SELECT EXISTS(
+                  SELECT 1
+                  FROM profiles p
+                  WHERE p.id=$1 AND p.role='candidate'
+                    AND (
+                      EXISTS (
+                        SELECT 1 FROM company_candidates cc
+                        WHERE cc.company_id=$2 AND cc.candidate_id=p.id AND cc.is_active=true
+                      )
+                      OR EXISTS (
+                        SELECT 1 FROM job_candidates jc
+                        WHERE jc.company_id=$2 AND jc.candidate_id=p.id
+                      )
+                      OR EXISTS (
+                        SELECT 1 FROM interviews i
+                        WHERE i.company_id=$2 AND i.candidate_id=p.id
+                      )
+                    )
+                )
+                """,
+                candidate_id,
+                actor.company_id,
+            )
+            if not candidate_exists:
+                raise ServiceError("candidate_not_found", status=404, retryable=False)
+
+            await conn.execute(
+                """
+                INSERT INTO job_candidates(company_id,job_id,candidate_id,added_by)
+                VALUES ($1,$2,$3,$4)
+                ON CONFLICT (company_id,job_id,candidate_id) DO NOTHING
+                """,
+                actor.company_id,
+                job_id,
+                candidate_id,
+                actor.user_id,
+            )
+            return UUID(str(job_id))
+
+
     async def assign_candidates(
         self,
         *,
@@ -471,7 +550,11 @@ class SchedulingRepository:
                 request.company_id,
                 request.job_id,
                 actor.user_id,
-                request.mode.value,
+                (
+                    SchedulingMode.AI_ASSISTED.value
+                    if request.mode == SchedulingMode.AUTO_BALANCED
+                    else request.mode.value
+                ),
                 request.timezone,
                 request.model_dump(mode="json"),
                 request_fingerprint,

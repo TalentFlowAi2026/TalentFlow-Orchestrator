@@ -16,6 +16,7 @@ from talentflow_orchestrator.api.dependencies import (
     idempotency_key,
 )
 from talentflow_orchestrator.api.schemas import (
+    AutoScheduleRequest,
     CancelRequest,
     CandidateAssignmentRequest,
     RescheduleAvailabilityRequest,
@@ -29,6 +30,7 @@ from talentflow_orchestrator.scheduling.models import (
     BusyInterval,
     BusyKind,
     ProposalDraft,
+    SchedulingMode,
     SchedulingPolicy,
     SchedulingRequest,
 )
@@ -138,6 +140,76 @@ async def assign_candidates(
         candidate_ids=body.candidate_ids,
     )
     return {"job_id": job_id, "candidate_ids": assigned}
+
+
+@router.post("/scheduling/auto", status_code=status.HTTP_201_CREATED)
+async def auto_schedule(
+    body: AutoScheduleRequest,
+    request: Request,
+    user_id: UserId,
+    key: IdempotencyKey,
+) -> dict[str, Any]:
+    """Resolve job role, choose the least-loaded slot, confirm, and enqueue integrations."""
+    repository = cast(SchedulingRepository, request.app.state.scheduling_repository)
+    actor = await repository.require_scheduling_manager(user_id, body.company_id)
+    job_id = await repository.resolve_job_posting_for_role(
+        actor=actor,
+        job_role_id=body.job_role_id,
+        candidate_id=body.candidate_id,
+    )
+    scheduling_request = SchedulingRequest(
+        company_id=body.company_id,
+        job_id=job_id,
+        prompt_template_id=body.prompt_template_id,
+        candidate_ids=[body.candidate_id],
+        interviewer_ids=body.interviewer_ids,
+        timezone=body.timezone,
+        start_date=body.date,
+        end_date=body.date,
+        duration_minutes=body.duration_minutes,
+        buffer_minutes=body.buffer_minutes,
+        language=body.language,
+        mode=SchedulingMode.AUTO_BALANCED,
+        notes=body.notes,
+    )
+    await repository.validate_scope(actor, scheduling_request)
+    policy = await repository.policy(body.company_id)
+    draft = _propose(
+        request,
+        repository,
+        scheduling_request,
+        policy,
+        await _busy_with_connected_calendar(
+            request, repository, actor, scheduling_request
+        ),
+    )
+    if not any(item.schedulable for item in draft.items):
+        raise ServiceError("no_schedulable_candidates", status=409, retryable=False)
+
+    fingerprint = request_fingerprint(scheduling_request)
+    proposal_id, _ = await repository.create_proposal(
+        actor=actor,
+        request=scheduling_request,
+        draft=draft,
+        idempotency_key=key,
+        correlation_id=correlation_id(request),
+        request_fingerprint=fingerprint,
+    )
+    external_busy = await _connected_calendar_busy(
+        request, repository, actor, scheduling_request
+    )
+    interviews = await repository.confirm(
+        proposal_id,
+        actor,
+        idempotency_key=key,
+        external_busy=external_busy,
+    )
+    return {
+        "proposal_id": proposal_id,
+        "job_id": job_id,
+        "job_role_id": body.job_role_id,
+        "interviews": interviews,
+    }
 
 
 @router.post("/scheduling/availability")

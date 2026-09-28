@@ -13,6 +13,38 @@ from talentflow_orchestrator.domain.models import Model
 from talentflow_orchestrator.scheduling.models import SchedulingMode
 
 
+class AutoScheduleRequest(Model):
+    """One-shot app scheduling request using a job role and a selected date."""
+
+    company_id: UUID
+    candidate_id: UUID
+    job_role_id: UUID
+    date: date
+    duration_minutes: int = Field(ge=5, le=180)
+    timezone: str = Field(min_length=1, max_length=64)
+    buffer_minutes: int = Field(default=0, ge=0, le=120)
+    interviewer_ids: list[UUID] = Field(default_factory=list, max_length=20)
+    prompt_template_id: UUID | None = None
+    language: str = Field(default="en", min_length=2, max_length=50)
+    notes: str = Field(default="", max_length=4000)
+
+    @field_validator("timezone")
+    @classmethod
+    def timezone_must_be_iana(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("timezone must be a valid IANA timezone") from exc
+        return value
+
+    @field_validator("interviewer_ids")
+    @classmethod
+    def interviewers_must_be_unique(cls, value: list[UUID]) -> list[UUID]:
+        if len(set(value)) != len(value):
+            raise ValueError("interviewer_ids must be unique")
+        return value
+
+
 class RescheduleAvailabilityRequest(Model):
     """Side-effect-free availability input for an existing interview."""
 
