@@ -1,0 +1,13 @@
+diff --git a/src/talentflow_orchestrator/persistence/repository.py b/src/talentflow_orchestrator/persistence/repository.py
+index 8319309..cf9a068 100644
+--- a/src/talentflow_orchestrator/persistence/repository.py
++++ b/src/talentflow_orchestrator/persistence/repository.py
+@@ -498,7 +498,7 @@ class SchedulingRepository:
+                     "proposed" if item.schedulable else "conflict",
+                     item.warnings,
+                     [entry.model_dump(mode="json") for entry in item.conflicts],
+-                    item.alternatives,
++                    [value.isoformat() for value in item.alternatives],
+                 )
+             await self._event(
+                 conn,

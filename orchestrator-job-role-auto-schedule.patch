@@ -1,0 +1,243 @@
+diff --git a/src/talentflow_orchestrator/api/routes/scheduling.py b/src/talentflow_orchestrator/api/routes/scheduling.py
+index 35b6f66..130ff2a 100644
+--- a/src/talentflow_orchestrator/api/routes/scheduling.py
++++ b/src/talentflow_orchestrator/api/routes/scheduling.py
+@@ -16,6 +16,7 @@ from talentflow_orchestrator.api.dependencies import (
+     idempotency_key,
+ )
+ from talentflow_orchestrator.api.schemas import (
++    AutoScheduleRequest,
+     CancelRequest,
+     CandidateAssignmentRequest,
+     RescheduleAvailabilityRequest,
+@@ -29,6 +30,7 @@ from talentflow_orchestrator.scheduling.models import (
+     BusyInterval,
+     BusyKind,
+     ProposalDraft,
++    SchedulingMode,
+     SchedulingPolicy,
+     SchedulingRequest,
+ )
+@@ -140,6 +142,76 @@ async def assign_candidates(
+     return {"job_id": job_id, "candidate_ids": assigned}
+ 
+ 
++@router.post("/scheduling/auto", status_code=status.HTTP_201_CREATED)
++async def auto_schedule(
++    body: AutoScheduleRequest,
++    request: Request,
++    user_id: UserId,
++    key: IdempotencyKey,
++) -> dict[str, Any]:
++    """Resolve job role, choose the least-loaded slot, confirm, and enqueue integrations."""
++    repository = cast(SchedulingRepository, request.app.state.scheduling_repository)
++    actor = await repository.require_scheduling_manager(user_id, body.company_id)
++    job_id = await repository.resolve_job_posting_for_role(
++        actor=actor,
++        job_role_id=body.job_role_id,
++        candidate_id=body.candidate_id,
++    )
++    scheduling_request = SchedulingRequest(
++        company_id=body.company_id,
++        job_id=job_id,
++        prompt_template_id=body.prompt_template_id,
++        candidate_ids=[body.candidate_id],
++        interviewer_ids=body.interviewer_ids,
++        timezone=body.timezone,
++        start_date=body.date,
++        end_date=body.date,
++        duration_minutes=body.duration_minutes,
++        buffer_minutes=body.buffer_minutes,
++        language=body.language,
++        mode=SchedulingMode.AUTO_BALANCED,
++        notes=body.notes,
++    )
++    await repository.validate_scope(actor, scheduling_request)
++    policy = await repository.policy(body.company_id)
++    draft = _propose(
++        request,
++        repository,
++        scheduling_request,
++        policy,
++        await _busy_with_connected_calendar(
++            request, repository, actor, scheduling_request
++        ),
++    )
++    if not any(item.schedulable for item in draft.items):
++        raise ServiceError("no_schedulable_candidates", status=409, retryable=False)
++
++    fingerprint = request_fingerprint(scheduling_request)
++    proposal_id, _ = await repository.create_proposal(
++        actor=actor,
++        request=scheduling_request,
++        draft=draft,
++        idempotency_key=key,
++        correlation_id=correlation_id(request),
++        request_fingerprint=fingerprint,
++    )
++    external_busy = await _connected_calendar_busy(
++        request, repository, actor, scheduling_request
++    )
++    interviews = await repository.confirm(
++        proposal_id,
++        actor,
++        idempotency_key=key,
++        external_busy=external_busy,
++    )
++    return {
++        "proposal_id": proposal_id,
++        "job_id": job_id,
++        "job_role_id": body.job_role_id,
++        "interviews": interviews,
++    }
++
++
+ @router.post("/scheduling/availability")
+ async def availability(
+     body: SchedulingRequest,
+diff --git a/src/talentflow_orchestrator/api/schemas.py b/src/talentflow_orchestrator/api/schemas.py
+index 26b7d7f..643d245 100644
+--- a/src/talentflow_orchestrator/api/schemas.py
++++ b/src/talentflow_orchestrator/api/schemas.py
+@@ -13,6 +13,38 @@ from talentflow_orchestrator.domain.models import Model
+ from talentflow_orchestrator.scheduling.models import SchedulingMode
+ 
+ 
++class AutoScheduleRequest(Model):
++    """One-shot app scheduling request using a job role and a selected date."""
++
++    company_id: UUID
++    candidate_id: UUID
++    job_role_id: UUID
++    date: date
++    duration_minutes: int = Field(ge=5, le=180)
++    timezone: str = Field(min_length=1, max_length=64)
++    buffer_minutes: int = Field(default=0, ge=0, le=120)
++    interviewer_ids: list[UUID] = Field(default_factory=list, max_length=20)
++    prompt_template_id: UUID | None = None
++    language: str = Field(default="en", min_length=2, max_length=50)
++    notes: str = Field(default="", max_length=4000)
++
++    @field_validator("timezone")
++    @classmethod
++    def timezone_must_be_iana(cls, value: str) -> str:
++        try:
++            ZoneInfo(value)
++        except ZoneInfoNotFoundError as exc:
++            raise ValueError("timezone must be a valid IANA timezone") from exc
++        return value
++
++    @field_validator("interviewer_ids")
++    @classmethod
++    def interviewers_must_be_unique(cls, value: list[UUID]) -> list[UUID]:
++        if len(set(value)) != len(value):
++            raise ValueError("interviewer_ids must be unique")
++        return value
++
++
+ class RescheduleAvailabilityRequest(Model):
+     """Side-effect-free availability input for an existing interview."""
+ 
+diff --git a/src/talentflow_orchestrator/persistence/repository.py b/src/talentflow_orchestrator/persistence/repository.py
+index 8319309..b5f0c09 100644
+--- a/src/talentflow_orchestrator/persistence/repository.py
++++ b/src/talentflow_orchestrator/persistence/repository.py
+@@ -131,6 +131,85 @@ class SchedulingRepository:
+         async with self.db.pool.acquire() as conn:
+             await self._validate_scope(conn, actor, request)
+ 
++    async def resolve_job_posting_for_role(
++        self,
++        *,
++        actor: Actor,
++        job_role_id: UUID,
++        candidate_id: UUID,
++    ) -> UUID:
++        """Resolve the newest company posting for a role and ensure candidate assignment."""
++        async with self.db.pool.acquire() as conn, conn.transaction():
++            await self._require_scheduling_manager(conn, actor.user_id, actor.company_id)
++            role_exists = await conn.fetchval(
++                """
++                SELECT EXISTS(
++                  SELECT 1 FROM job_roles
++                  WHERE id=$1 AND (company_id IS NULL OR company_id=$2) AND is_active=true
++                )
++                """,
++                job_role_id,
++                actor.company_id,
++            )
++            if not role_exists:
++                raise ServiceError("job_role_not_found", status=404, retryable=False)
++
++            job_id = await conn.fetchval(
++                """
++                SELECT id
++                FROM job_postings
++                WHERE company_id=$1 AND job_role_id=$2 AND status<>'archived'
++                ORDER BY created_at DESC,id DESC
++                LIMIT 1
++                """,
++                actor.company_id,
++                job_role_id,
++            )
++            if job_id is None:
++                raise ServiceError("position_not_found", status=404, retryable=False)
++
++            candidate_exists = await conn.fetchval(
++                """
++                SELECT EXISTS(
++                  SELECT 1
++                  FROM profiles p
++                  WHERE p.id=$1 AND p.role='candidate'
++                    AND (
++                      EXISTS (
++                        SELECT 1 FROM company_candidates cc
++                        WHERE cc.company_id=$2 AND cc.candidate_id=p.id AND cc.is_active=true
++                      )
++                      OR EXISTS (
++                        SELECT 1 FROM job_candidates jc
++                        WHERE jc.company_id=$2 AND jc.candidate_id=p.id
++                      )
++                      OR EXISTS (
++                        SELECT 1 FROM interviews i
++                        WHERE i.company_id=$2 AND i.candidate_id=p.id
++                      )
++                    )
++                )
++                """,
++                candidate_id,
++                actor.company_id,
++            )
++            if not candidate_exists:
++                raise ServiceError("candidate_not_found", status=404, retryable=False)
++
++            await conn.execute(
++                """
++                INSERT INTO job_candidates(company_id,job_id,candidate_id,added_by)
++                VALUES ($1,$2,$3,$4)
++                ON CONFLICT (company_id,job_id,candidate_id) DO NOTHING
++                """,
++                actor.company_id,
++                job_id,
++                candidate_id,
++                actor.user_id,
++            )
++            return UUID(str(job_id))
++
++
+     async def assign_candidates(
+         self,
+         *,
+@@ -471,7 +550,11 @@ class SchedulingRepository:
+                 request.company_id,
+                 request.job_id,
+                 actor.user_id,
+-                request.mode.value,
++                (
++                    SchedulingMode.AI_ASSISTED.value
++                    if request.mode == SchedulingMode.AUTO_BALANCED
++                    else request.mode.value
++                ),
+                 request.timezone,
+                 request.model_dump(mode="json"),
+                 request_fingerprint,
