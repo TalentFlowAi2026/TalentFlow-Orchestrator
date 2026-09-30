@@ -57,7 +57,13 @@ class SchedulingEngine:
         busy_intervals: Iterable[BusyInterval] = (),
         *,
         max_horizon_days: int = 31,
+        now: datetime | None = None,
     ) -> ProposalDraft:
+        scheduling_now = now or datetime.now(UTC)
+        if scheduling_now.tzinfo is None:
+            raise ValueError("now must be timezone-aware")
+        scheduling_now = scheduling_now.astimezone(UTC)
+
         if (request.end_date - request.start_date).days + 1 > max_horizon_days:
             raise ValueError("scheduling_horizon_exceeded")
 
@@ -78,7 +84,7 @@ class SchedulingEngine:
             if request.mode == SchedulingMode.AUTO_BALANCED:
                 ranked_slots: list[tuple[int, int, datetime, datetime]] = []
                 current_busy = [*busy, *allocated]
-                for slot_start, slot_end, time_error in self._candidate_slots(request, policy):
+                for slot_start, slot_end, time_error in self._candidate_slots(request, policy, now=scheduling_now):
                     if time_error is not None:
                         rejected[time_error]
                         continue
@@ -114,7 +120,7 @@ class SchedulingEngine:
                     chosen = (start, end)
                     alternatives = [item[2] for item in ranked_slots[1:4]]
             else:
-                for slot_start, slot_end, time_error in self._candidate_slots(request, policy):
+                for slot_start, slot_end, time_error in self._candidate_slots(request, policy, now=scheduling_now):
                     if time_error is not None:
                         rejected[time_error]
                         continue
@@ -128,6 +134,7 @@ class SchedulingEngine:
                         company_parallelism=company_parallelism,
                         backend_parallelism=backend_parallelism,
                         busy=[*busy, *allocated],
+                        now=scheduling_now,
                     )
                     if conflicts:
                         for code, reference_id in conflicts:
@@ -256,6 +263,7 @@ class SchedulingEngine:
                 company_parallelism=company_parallelism,
                 backend_parallelism=backend_parallelism,
                 busy=[*busy, *allocated],
+                now=scheduling_now,
             ),
         )
 
@@ -263,13 +271,24 @@ class SchedulingEngine:
         self,
         request: SchedulingRequest,
         policy: SchedulingPolicy,
+        *,
+        now: datetime,
     ) -> Iterator[tuple[datetime | None, datetime | None, str | None]]:
         timezone = ZoneInfo(request.timezone)
+        local_now = now.astimezone(timezone)
+        local_today = local_now.date()
+        minimum_start_utc = (
+            local_now + timedelta(minutes=policy.minimum_lead_minutes)
+        ).astimezone(UTC)
+
         current_day = request.start_date
         duration = timedelta(minutes=request.duration_minutes)
         increment = timedelta(minutes=policy.slot_increment_minutes)
 
         while current_day <= request.end_date:
+            if current_day < local_today:
+                current_day += timedelta(days=1)
+                continue
             if current_day.weekday() not in policy.allowed_weekdays:
                 current_day += timedelta(days=1)
                 continue
@@ -287,7 +306,18 @@ class SchedulingEngine:
                 if time_error is not None:
                     yield None, None, time_error
                 elif aware_start is not None and aware_end is not None:
-                    yield aware_start.astimezone(UTC), aware_end.astimezone(UTC), None
+                    slot_start_utc = aware_start.astimezone(UTC)
+                    slot_end_utc = aware_end.astimezone(UTC)
+
+                    # Same-day scheduling must never select a slot in the past.
+                    # Keep at least policy.minimum_lead_minutes between "now"
+                    # and the interview start. Because slots are generated on
+                    # the configured increment, the next valid slot is
+                    # naturally rounded up to that grid.
+                    if current_day == local_today and slot_start_utc < minimum_start_utc:
+                        pass
+                    else:
+                        yield slot_start_utc, slot_end_utc, None
                 if request.mode == SchedulingMode.EXPLICIT:
                     break
                 cursor += increment
@@ -321,6 +351,7 @@ class SchedulingEngine:
         company_parallelism: int,
         backend_parallelism: int,
         busy: list[BusyInterval],
+        now: datetime,
     ) -> list[datetime]:
         if request.window_start is None:
             return []
@@ -336,7 +367,9 @@ class SchedulingEngine:
         ).astimezone(UTC)
         valid: list[datetime] = []
         for slot_start, slot_end, time_error in self._candidate_slots(
-            alternative_request, policy
+            alternative_request,
+            policy,
+            now=now,
         ):
             if time_error or slot_start is None or slot_end is None:
                 continue
@@ -365,10 +398,15 @@ class SchedulingEngine:
         company_parallelism: int,
         backend_parallelism: int,
         busy: list[BusyInterval],
+        now: datetime,
     ) -> list[FreeInterval]:
         search_request = request.model_copy(update={"mode": SchedulingMode.AI_ASSISTED})
         free: list[FreeInterval] = []
-        slots = self._candidate_slots(search_request, policy)
+        slots = self._candidate_slots(
+            search_request,
+            policy,
+            now=now,
+        )
         for slot_start, slot_end, time_error in slots:
             if time_error or slot_start is None or slot_end is None:
                 continue

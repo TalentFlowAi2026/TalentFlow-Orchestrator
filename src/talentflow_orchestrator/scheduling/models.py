@@ -41,6 +41,7 @@ class SchedulingPolicy(Model):
     max_parallel_ai_interviews: int = Field(ge=1, le=100)
     backend_max_parallel_ai_interviews: int = Field(ge=1, le=100)
     slot_increment_minutes: int = Field(default=15, ge=1, le=60)
+    minimum_lead_minutes: int = Field(default=15, ge=0, le=1440)
     default_interview_day_start: time = time(7)
     default_interview_day_end: time = time(17)
     allowed_weekdays: list[int] = Field(default_factory=lambda: list(range(7)), min_length=1)
@@ -84,6 +85,7 @@ class CompanySchedulingSettings(Model):
     default_duration_minutes: int | None = Field(default=None, ge=5, le=180)
     default_buffer_minutes: int = Field(default=0, ge=0, le=120)
     slot_increment_minutes: int = Field(default=15, ge=1, le=60)
+    minimum_lead_minutes: int = Field(default=15, ge=0, le=1440)
     allowed_weekdays: list[int] = Field(default_factory=lambda: list(range(7)), min_length=1)
     working_hours: dict[int, DailyWorkingHours] = Field(default_factory=dict)
     enforce_working_hours: bool = False
@@ -127,6 +129,7 @@ class CompanySchedulingSettings(Model):
             ),
             backend_max_parallel_ai_interviews=backend_limit,
             slot_increment_minutes=self.slot_increment_minutes,
+            minimum_lead_minutes=self.minimum_lead_minutes,
             default_interview_day_start=default_day_start,
             default_interview_day_end=default_day_end,
             allowed_weekdays=self.allowed_weekdays,
