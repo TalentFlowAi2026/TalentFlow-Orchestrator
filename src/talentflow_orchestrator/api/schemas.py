@@ -14,36 +14,106 @@ from talentflow_orchestrator.scheduling.models import SchedulingMode
 
 
 class AutoScheduleRequest(Model):
-    """One-shot app scheduling request using a job role and a selected date."""
+    """One-shot app scheduling request using a job role and selected date."""
 
     company_id: UUID
-    candidate_id: UUID
+
+    # Backward compatibility:
+    # old Flutter sends candidate_id
+    # new Flutter bulk flow sends candidate_ids
+    candidate_id: UUID | None = None
+    candidate_ids: list[UUID] | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+    )
+
     job_role_id: UUID
     date: date
     duration_minutes: int = Field(ge=5, le=180)
     timezone: str = Field(min_length=1, max_length=64)
     buffer_minutes: int = Field(default=0, ge=0, le=120)
-    interviewer_ids: list[UUID] = Field(default_factory=list, max_length=20)
+    interviewer_ids: list[UUID] = Field(
+        default_factory=list,
+        max_length=20,
+    )
     prompt_template_id: UUID | None = None
-    language: str = Field(default="en", min_length=2, max_length=50)
+    language: str = Field(
+        default="en",
+        min_length=2,
+        max_length=50,
+    )
     notes: str = Field(default="", max_length=4000)
 
     @field_validator("timezone")
     @classmethod
-    def timezone_must_be_iana(cls, value: str) -> str:
+    def timezone_must_be_iana(
+        cls,
+        value: str,
+    ) -> str:
         try:
             ZoneInfo(value)
         except ZoneInfoNotFoundError as exc:
-            raise ValueError("timezone must be a valid IANA timezone") from exc
+            raise ValueError(
+                "timezone must be a valid IANA timezone"
+            ) from exc
+
         return value
 
     @field_validator("interviewer_ids")
     @classmethod
-    def interviewers_must_be_unique(cls, value: list[UUID]) -> list[UUID]:
+    def interviewers_must_be_unique(
+        cls,
+        value: list[UUID],
+    ) -> list[UUID]:
         if len(set(value)) != len(value):
-            raise ValueError("interviewer_ids must be unique")
+            raise ValueError(
+                "interviewer_ids must be unique"
+            )
+
         return value
 
+    @field_validator("candidate_ids")
+    @classmethod
+    def candidates_must_be_unique(
+        cls,
+        value: list[UUID] | None,
+    ) -> list[UUID] | None:
+        if value is not None and len(set(value)) != len(value):
+            raise ValueError(
+                "candidate_ids must be unique"
+            )
+
+        return value
+
+    @model_validator(mode="after")
+    def candidate_selection_is_valid(
+        self,
+    ) -> Self:
+        has_single = self.candidate_id is not None
+        has_multiple = bool(self.candidate_ids)
+
+        if not has_single and not has_multiple:
+            raise ValueError(
+                "candidate_id or candidate_ids is required"
+            )
+
+        if has_single and has_multiple:
+            raise ValueError(
+                "send either candidate_id or candidate_ids, not both"
+            )
+
+        return self
+
+    @property
+    def resolved_candidate_ids(self) -> list[UUID]:
+        if self.candidate_ids:
+            return self.candidate_ids
+
+        if self.candidate_id is not None:
+            return [self.candidate_id]
+
+        return []
 
 class RescheduleAvailabilityRequest(Model):
     """Side-effect-free availability input for an existing interview."""
