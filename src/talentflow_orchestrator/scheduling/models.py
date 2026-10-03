@@ -21,6 +21,7 @@ class SchedulingMode(StrEnum):
 
 class BusyKind(StrEnum):
     CANDIDATE = "candidate"
+    CANDIDATE_JOB_DAY = "candidate_job_day"
     INTERVIEWER = "interviewer"
     CALENDAR = "calendar"
     CAPACITY = "capacity"
@@ -219,7 +220,12 @@ class BusyInterval(Model):
             raise ValueError("busy intervals must be timezone-aware")
         if self.end <= self.start:
             raise ValueError("busy interval end must be after start")
-        if self.kind in {BusyKind.CANDIDATE, BusyKind.INTERVIEWER, BusyKind.CALENDAR}:
+        if self.kind in {
+            BusyKind.CANDIDATE,
+            BusyKind.CANDIDATE_JOB_DAY,
+            BusyKind.INTERVIEWER,
+            BusyKind.CALENDAR,
+        }:
             if self.owner_id is None:
                 raise ValueError("owner_id is required for person-scoped busy intervals")
         return self

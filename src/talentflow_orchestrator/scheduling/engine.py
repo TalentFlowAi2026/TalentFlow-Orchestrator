@@ -47,6 +47,9 @@ _CONFLICT_MESSAGES = {
     "ambiguous_local_time": "The requested local time is ambiguous because of a DST transition.",
 
     "candidate_conflict": "The candidate already has a conflicting interview.",
+    "candidate_job_same_day_conflict": (
+        "The candidate already has an interview for this position on this date."
+    ),
 
     "backend_capacity_exceeded": "The backend-wide parallel interview capacity is already in use.",
 
@@ -890,6 +893,20 @@ class SchedulingEngine:
 
                     conflicts.append(("candidate_conflict", interval.reference_id))
 
+            elif (
+                interval.kind == BusyKind.CANDIDATE_JOB_DAY
+                and interval.owner_id == candidate_id
+            ):
+
+                # This interval represents the candidate's entire local scheduling day
+                # for the same company + job. Do not apply interview buffers here,
+                # otherwise a buffer could incorrectly spill into an adjacent day.
+                if _overlaps(slot_start, slot_end, interval.start, interval.end):
+
+                    conflicts.append(
+                        ("candidate_job_same_day_conflict", interval.reference_id)
+                    )
+
             elif interval.kind in {BusyKind.INTERVIEWER, BusyKind.CALENDAR}:
 
                 if interval.owner_id in request.interviewer_ids and self._buffered_overlap(
@@ -997,6 +1014,17 @@ class SchedulingEngine:
                 if self._buffered_overlap(request, slot_start, slot_end, interval):
 
                     conflicts.append(("candidate_conflict", interval.reference_id))
+
+            elif (
+                interval.kind == BusyKind.CANDIDATE_JOB_DAY
+                and interval.owner_id == candidate_id
+            ):
+
+                if _overlaps(slot_start, slot_end, interval.start, interval.end):
+
+                    conflicts.append(
+                        ("candidate_job_same_day_conflict", interval.reference_id)
+                    )
 
             elif interval.kind in {BusyKind.INTERVIEWER, BusyKind.CALENDAR}:
 

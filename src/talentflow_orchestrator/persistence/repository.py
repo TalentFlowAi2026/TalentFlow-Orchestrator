@@ -479,6 +479,48 @@ class SchedulingRepository:
                     buffer_minutes=stored_buffer,
                 )
             )
+        # Same company + same candidate + same job + same local date is a hard
+        # duplicate-prevention rule, even when the interview times do not overlap.
+        # Failed/cancelled interviews are intentionally excluded so HR can reschedule.
+        same_job_day_rows = await conn.fetch(
+            """
+            SELECT i.id,i.candidate_id,i.scheduled_at
+            FROM interviews i
+            WHERE i.company_id=$1
+              AND i.job_id=$2
+              AND i.candidate_id=ANY($3::uuid[])
+              AND i.status IN ('scheduled','in_progress','completed')
+              AND i.scheduled_at >= $4
+              AND i.scheduled_at < $5
+              AND ($6::uuid IS NULL OR i.id<>$6)
+            """,
+            request.company_id,
+            request.job_id,
+            request.candidate_ids,
+            timezone_start,
+            timezone_end,
+            exclude_interview_id,
+        )
+        for row in same_job_day_rows:
+            scheduled_local_date = row["scheduled_at"].astimezone(zone).date()
+            day_start = datetime.combine(
+                scheduled_local_date, time.min, tzinfo=zone
+            ).astimezone(UTC)
+            day_end = datetime.combine(
+                scheduled_local_date + timedelta(days=1), time.min, tzinfo=zone
+            ).astimezone(UTC)
+            result.append(
+                BusyInterval(
+                    start=day_start,
+                    end=day_end,
+                    kind=BusyKind.CANDIDATE_JOB_DAY,
+                    owner_id=UUID(str(row["candidate_id"])),
+                    source="candidate_job_day",
+                    reference_id=UUID(str(row["id"])),
+                    buffer_minutes=0,
+                )
+            )
+
         if interview_ids and request.interviewer_ids:
             assignments = await conn.fetch(
                 """

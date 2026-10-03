@@ -776,3 +776,40 @@ def test_auto_balanced_uses_fifteen_minute_candidates_and_real_duration() -> Non
 
     assert item.proposed_start == datetime(2026, 10, 1, 10, 30, tzinfo=zone).astimezone(UTC)
     assert item.proposed_end == datetime(2026, 10, 1, 11, 0, tzinfo=zone).astimezone(UTC)
+
+
+
+def test_same_company_candidate_job_same_day_is_blocked_without_buffer_spill() -> None:
+    candidate = uuid4()
+    reference = uuid4()
+    request = request_for(
+        [candidate],
+        mode=SchedulingMode.AI_ASSISTED,
+        start=time(10),
+        end=time(16),
+        duration=30,
+        buffer=60,
+    )
+    zone = ZoneInfo(request.timezone)
+    local_day_start = datetime(2026, 10, 1, 0, 0, tzinfo=zone).astimezone(UTC)
+    local_next_day = datetime(2026, 10, 2, 0, 0, tzinfo=zone).astimezone(UTC)
+
+    item = SchedulingEngine().propose(
+        request,
+        policy(),
+        [
+            BusyInterval(
+                start=local_day_start,
+                end=local_next_day,
+                kind=BusyKind.CANDIDATE_JOB_DAY,
+                owner_id=candidate,
+                source="candidate_job_day",
+                reference_id=reference,
+            )
+        ],
+        now=datetime(2026, 9, 30, 12, tzinfo=UTC),
+    ).items[0]
+
+    assert item.schedulable is False
+    conflicts = {entry.code: entry.conflicting_reference_ids for entry in item.conflicts}
+    assert conflicts["candidate_job_same_day_conflict"] == [reference]
