@@ -11,6 +11,7 @@ import asyncio
 import smtplib
 import ssl
 from email.message import EmailMessage as MimeMessage
+from email.utils import formataddr
 
 from talentflow_orchestrator.config.settings import Settings
 from talentflow_orchestrator.domain.models import ServiceError
@@ -50,7 +51,7 @@ class SMTPProvider:
         if message.from_email.lower() != self.settings.smtp_from_address.lower():
             raise ServiceError("smtp_sender_mismatch", retryable=False)
         mime = MimeMessage()
-        mime["From"] = str(message.from_email)
+        mime["From"] = formataddr(("TalentFlow AI", str(message.from_email)))
         mime["To"] = str(message.to)
         mime["Subject"] = message.subject
         mime["Message-ID"] = f"<{message.logical_message_id}>"
