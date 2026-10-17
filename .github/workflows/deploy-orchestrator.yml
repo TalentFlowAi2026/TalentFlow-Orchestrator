@@ -10,9 +10,9 @@ permissions:
   contents: read
 
 env:
-  AZURE_RESOURCE_GROUP: talentflow-orchestrator-prod-rg
-  ACR_NAME: talentflowai2026acr
-  ACR_LOGIN_SERVER: talentflowai2026acr.azurecr.io
+  AZURE_RESOURCE_GROUP: rg-talentflow-prod
+  ACR_NAME: talentflowai2026it
+  ACR_LOGIN_SERVER: talentflowai2026it.azurecr.io
   IMAGE_REPOSITORY: talentflow-orchestrator
   API_APP_NAME: talentflow-orchestrator-api
   WORKER_APP_NAME: talentflow-orchestrator-worker
@@ -84,7 +84,7 @@ jobs:
           set -euo pipefail
 
           for i in 1 2 3 4 5 6; do
-            if curl --fail --silent --show-error https://orchestrator.talant-flow.app/health; then
+            if curl --fail --silent --show-error https://talentflow-orchestrator-api.kindflower-adf8caac.germanywestcentral.azurecontainerapps.io/ready; then
               echo
               exit 0
             fi
