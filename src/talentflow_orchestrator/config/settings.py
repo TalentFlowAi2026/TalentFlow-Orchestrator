@@ -57,6 +57,15 @@ class Settings(BaseSettings):
     google_calendar_enabled: bool = False
     gmail_enabled: bool = False
 
+    # System-owned SMTP sender for interview mail; no company Google account required.
+    smtp_enabled: bool = False
+    smtp_host: str = ""
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_scheme: Literal["smtp", "smtps"] = "smtp"
+    smtp_username: str = ""
+    smtp_password: SecretStr = SecretStr("")
+    smtp_from_address: str = ""
+
     google_api_key: SecretStr = SecretStr("")
     gemini_scheduling_model: str = "gemini-3.1-pro-preview"
     gemini_intent_timeout_seconds: float = Field(default=30, gt=0, le=120)
@@ -108,6 +117,20 @@ class Settings(BaseSettings):
             redirect = urlsplit(self.google_oauth_redirect_uri)
             if redirect.scheme not in {"http", "https"} or not redirect.netloc:
                 raise ValueError("GOOGLE_OAUTH_REDIRECT_URI must be an absolute HTTP(S) URL")
+
+        if self.smtp_enabled:
+            required_smtp = {
+                "SMTP_HOST": self.smtp_host,
+                "SMTP_USERNAME": self.smtp_username,
+                "SMTP_PASSWORD": self.smtp_password.get_secret_value(),
+                "SMTP_FROM_ADDRESS": self.smtp_from_address,
+            }
+            missing_smtp = [name for name, value in required_smtp.items() if not value]
+            if missing_smtp:
+                raise ValueError("SMTP configuration missing: " + ", ".join(missing_smtp))
+            # Fail closed instead of silently downgrading SMTP encryption.
+            if self.smtp_scheme == "smtp" and self.smtp_port == 465:
+                raise ValueError("SMTP_SCHEME=smtps is required for implicit TLS port 465")
 
         if self.environment in {"staging", "production"}:
             if urlsplit(self.supabase_url).scheme != "https":

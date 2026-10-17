@@ -40,6 +40,15 @@ class GmailProvider:
         mime["Subject"] = message.subject
         mime["Message-ID"] = rfc_message_id
         mime.set_content(message.body)
+        if message.html_body is not None:
+            mime.add_alternative(message.html_body, subtype="html")
+        if message.calendar_ics is not None:
+            mime.add_attachment(
+                message.calendar_ics.encode("utf-8"),
+                maintype="text",
+                subtype="calendar",
+                filename="talentflow-interview.ics",
+            )
         raw = base64.urlsafe_b64encode(mime.as_bytes()).rstrip(b"=").decode()
         response = await self._request(
             "POST",

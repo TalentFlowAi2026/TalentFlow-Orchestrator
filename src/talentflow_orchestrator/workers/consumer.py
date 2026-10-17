@@ -19,6 +19,7 @@ from talentflow_orchestrator.providers.disabled import (
 from talentflow_orchestrator.providers.google.calendar import GoogleCalendarProvider
 from talentflow_orchestrator.providers.google.gmail import GmailProvider
 from talentflow_orchestrator.providers.google.oauth import GoogleOAuthProvider
+from talentflow_orchestrator.providers.smtp import SMTPProvider
 from talentflow_orchestrator.queue.postgres import OrchestratorQueue
 from talentflow_orchestrator.workers.handlers import AccessTokenManager, SchedulingJobHandlers
 
@@ -208,12 +209,15 @@ async def async_main() -> None:
         else DisabledCalendarProvider()
     )
     email = GmailProvider(settings) if settings.gmail_enabled else DisabledEmailProvider()
+    smtp_email = SMTPProvider(settings) if settings.smtp_enabled else None
     handlers = SchedulingJobHandlers(
         queue=queue,
         integrations=integrations,
         tokens=AccessTokenManager(integrations, oauth),
         calendar=calendar,
         email=email,
+        smtp_email=smtp_email,
+        smtp_from_email=settings.smtp_from_address,
     )
     consumer = OrchestratorConsumer(queue=queue, handlers=handlers, settings=settings)
     stop_event = asyncio.Event()
@@ -233,6 +237,8 @@ async def async_main() -> None:
     finally:
         await calendar.aclose()
         await email.aclose()
+        if smtp_email is not None:
+            await smtp_email.aclose()
         await oauth.aclose()
         await database.close()
 

@@ -61,6 +61,8 @@ class EmailMessage(Model):
     to: EmailAddress
     subject: str = Field(min_length=1, max_length=200)
     body: str = Field(min_length=1, max_length=10000)
+    html_body: str | None = Field(default=None, max_length=30000)
+    calendar_ics: str | None = Field(default=None, max_length=10000)
 
 
 class OAuthProvider(Protocol):

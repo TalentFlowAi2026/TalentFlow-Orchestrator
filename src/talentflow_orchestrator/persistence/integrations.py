@@ -33,7 +33,7 @@ class ActionContext:
     action_id: UUID
     company_id: UUID
     interview_id: UUID
-    provider_account_id: UUID
+    provider_account_id: UUID | None
     action: str
     schedule_version: int
     correlation_id: UUID
@@ -48,6 +48,7 @@ class ActionContext:
     position_title: str
     invitation_url: str | None
     prior_provider_resource_id: str | None
+    provider: str = "gmail"
 
 
 class IntegrationRepository:
@@ -353,7 +354,11 @@ class IntegrationRepository:
             )
             if updated != "UPDATE 1":
                 return None
-            invitation_url = await self._invitation_url(conn, job.interview_id)
+            invitation_url = (
+                None
+                if row["provider"] == "smtp"
+                else await self._invitation_url(conn, job.interview_id)
+            )
             prior_resource = await conn.fetchval(
                 """
                 SELECT provider_resource_id FROM integration_actions
@@ -369,7 +374,12 @@ class IntegrationRepository:
                 action_id=job.integration_action_id,
                 company_id=job.company_id,
                 interview_id=job.interview_id,
-                provider_account_id=UUID(str(row["provider_account_id"])),
+                provider_account_id=(
+                    UUID(str(row["provider_account_id"]))
+                    if row["provider_account_id"] is not None
+                    else None
+                ),
+                provider=str(row["provider"]),
                 action=action,
                 schedule_version=job.expected_schedule_version,
                 correlation_id=job.correlation_id,

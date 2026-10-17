@@ -23,6 +23,11 @@ from talentflow_orchestrator.providers.base import (
     ProviderAccount,
 )
 from talentflow_orchestrator.queue.postgres import OrchestratorQueue
+from talentflow_orchestrator.workers.interview_email import (
+    calendar_ics,
+    google_calendar_url,
+    render_email_html,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,12 +60,16 @@ class SchedulingJobHandlers:
         tokens: AccessTokenManager,
         calendar: CalendarProvider,
         email: EmailProvider,
+        smtp_email: EmailProvider | None = None,
+        smtp_from_email: str = "",
     ) -> None:
         self.queue = queue
         self.integrations = integrations
         self.tokens = tokens
         self.calendar = calendar
         self.email = email
+        self.smtp_email = smtp_email
+        self.smtp_from_email = smtp_from_email
 
     async def handle(self, job: OrchestratorJob) -> None:
         context = await self.integrations.begin_action(job)
@@ -68,6 +77,27 @@ class SchedulingJobHandlers:
             return
         if not await self.queue.is_active_lease(job):
             raise ServiceError("job_cancelled", retryable=False)
+        if context.provider == "smtp":
+            if job.kind not in {
+                JobKind.SEND_INVITATION,
+                JobKind.SEND_RESCHEDULE,
+                JobKind.SEND_CANCELLATION,
+            } or self.smtp_email is None:
+                raise ServiceError("smtp_provider_unavailable", retryable=False)
+            resource_id = await self.smtp_email.send(
+                "", self._email(context, job.kind, from_email=self.smtp_from_email)
+            )
+            await self.integrations.action_succeeded(context, resource_id)
+            logger.info("interview_smtp_email_sent", extra={
+                "company_id": str(context.company_id),
+                "interview_id": str(context.interview_id),
+                "correlation_id": str(context.correlation_id),
+                "job_id": str(job.id),
+            })
+            return
+
+        if context.provider_account_id is None:
+            raise ServiceError("provider_account_missing", retryable=False)
         access_token, account = await self.tokens.token(
             context.provider_account_id, context.company_id
         )
@@ -77,8 +107,6 @@ class SchedulingJobHandlers:
         if job.kind in {
             JobKind.CREATE_CALENDAR_EVENT,
             JobKind.UPDATE_CALENDAR_EVENT,
-            JobKind.SEND_INVITATION,
-            JobKind.SEND_RESCHEDULE,
         } and context.invitation_url is None:
             raise ServiceError("invitation_unavailable", retryable=False)
 
@@ -188,9 +216,39 @@ class SchedulingJobHandlers:
                 f"Your {context.position_title} interview with {context.company_name} "
                 f"is scheduled for {local_start:%Y-%m-%d %H:%M} ({context.timezone}).\n"
                 f"Duration: {int((context.scheduled_end_at-context.scheduled_at).total_seconds()/60)} minutes.\n"
-                f"Interview link: {context.invitation_url or ''}\n\n"
-                "Please sign in with the invited account and join shortly before the start time.\n"
+                "Open the TalentFlow AI mobile app shortly before the interview.\n"
             )
+        calendar_link = (
+            google_calendar_url(
+                position=context.position_title,
+                company=context.company_name,
+                start=context.scheduled_at,
+                end=context.scheduled_end_at,
+                timezone=context.timezone,
+            )
+            if kind != JobKind.SEND_CANCELLATION
+            else None
+        )
+        if calendar_link:
+            body += f"\nAdd to Google Calendar: {calendar_link}\n"
+        html_body = render_email_html(
+            candidate=context.candidate_name,
+            company=context.company_name,
+            position=context.position_title,
+            start=local_start,
+            timezone=context.timezone,
+            kind=kind,
+            calendar_url=calendar_link,
+        )
+        attachment = calendar_ics(
+            interview_id=context.interview_id,
+            version=context.schedule_version,
+            company=context.company_name,
+            position=context.position_title,
+            start=context.scheduled_at,
+            end=context.scheduled_end_at,
+            cancelled=(kind == JobKind.SEND_CANCELLATION),
+        )
         try:
             return EmailMessage(
                 logical_message_id=(
@@ -200,6 +258,8 @@ class SchedulingJobHandlers:
                 to=context.candidate_email,
                 subject=f"{action_word}: {context.position_title}",
                 body=body,
+                html_body=html_body,
+                calendar_ics=attachment,
             )
         except ValidationError as exc:
             raise ServiceError("email_payload_invalid", retryable=False) from exc

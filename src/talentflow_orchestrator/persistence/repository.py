@@ -138,20 +138,26 @@ class SchedulingRepository:
         job_role_id: UUID,
         candidate_id: UUID,
     ) -> UUID:
-        """Resolve the newest company posting for a role and ensure candidate assignment."""
+        """Find or create the company posting for a role, then assign the candidate."""
         async with self.db.pool.acquire() as conn, conn.transaction():
             await self._require_scheduling_manager(conn, actor.user_id, actor.company_id)
-            role_exists = await conn.fetchval(
+            # Serialize first-time posting creation for the same company and role.
+            # An automatic scheduling retry must reuse the posting, not create duplicates.
+            await conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtext($1::uuid::text), hashtext($2::uuid::text))",
+                actor.company_id,
+                job_role_id,
+            )
+            role = await conn.fetchrow(
                 """
-                SELECT EXISTS(
-                  SELECT 1 FROM job_roles
-                  WHERE id=$1 AND (company_id IS NULL OR company_id=$2) AND is_active=true
-                )
+                SELECT title, description
+                FROM job_roles
+                WHERE id=$1 AND (company_id IS NULL OR company_id=$2) AND is_active=true
                 """,
                 job_role_id,
                 actor.company_id,
             )
-            if not role_exists:
+            if role is None:
                 raise ServiceError("job_role_not_found", status=404, retryable=False)
 
             job_id = await conn.fetchval(
@@ -166,7 +172,23 @@ class SchedulingRepository:
                 job_role_id,
             )
             if job_id is None:
-                raise ServiceError("position_not_found", status=404, retryable=False)
+                # A company/global job role need not already have a posting.
+                # Create its company-specific draft within this same transaction.
+                title = str(role["title"]).strip()
+                description = str(role["description"] or "").strip() or title
+                job_id = await conn.fetchval(
+                    """
+                    INSERT INTO job_postings
+                      (company_id, created_by, title, description, status, job_role_id)
+                    VALUES ($1, $2, $3, $4, 'draft', $5)
+                    RETURNING id
+                    """,
+                    actor.company_id,
+                    actor.user_id,
+                    title,
+                    description,
+                    job_role_id,
+                )
 
             candidate_exists = await conn.fetchval(
                 """
@@ -668,7 +690,7 @@ class SchedulingRepository:
                 LEFT JOIN LATERAL (
                   SELECT ia.status,ia.error_code FROM integration_actions ia
                   WHERE ia.interview_id=spi.interview_id AND ia.company_id=spi.company_id
-                    AND ia.provider='gmail'
+                    AND ia.provider IN ('gmail', 'smtp')
                   ORDER BY ia.schedule_version DESC,ia.created_at DESC LIMIT 1
                 ) email ON true
                 WHERE spi.proposal_id=$1 ORDER BY spi.proposed_start_at NULLS LAST,spi.id
@@ -866,17 +888,16 @@ class SchedulingRepository:
                     item_id,
                     interview_id,
                 )
-                if provider_account_id is not None:
-                    await self._create_provider_actions(
-                        conn,
-                        company_id=request.company_id,
-                        proposal_id=proposal_id,
-                        interview_id=interview_id,
-                        provider_account_id=provider_account_id,
-                        schedule_version=1,
-                        correlation_id=UUID(str(proposal["correlation_id"])),
-                        kinds=(JobKind.CREATE_CALENDAR_EVENT, JobKind.SEND_INVITATION),
-                    )
+                await self._create_provider_actions(
+                    conn,
+                    company_id=request.company_id,
+                    proposal_id=proposal_id,
+                    interview_id=interview_id,
+                    provider_account_id=provider_account_id,
+                    schedule_version=1,
+                    correlation_id=UUID(str(proposal["correlation_id"])),
+                    kinds=(JobKind.CREATE_CALENDAR_EVENT, JobKind.SEND_INVITATION),
+                )
                 await self._event(
                     conn,
                     company_id=request.company_id,
@@ -902,7 +923,8 @@ class SchedulingRepository:
                         ),
                         "email_status": (
                             "pending"
-                            if provider_account_id and self.settings.gmail_enabled
+                            if self.settings.smtp_enabled
+                            or (provider_account_id and self.settings.gmail_enabled)
                             else "not_connected"
                         ),
                     }
@@ -955,7 +977,7 @@ class SchedulingRepository:
             LEFT JOIN LATERAL (
               SELECT ia.status,ia.error_code FROM integration_actions ia
               WHERE ia.interview_id=spi.interview_id AND ia.company_id=spi.company_id
-                AND ia.provider='gmail'
+                AND ia.provider IN ('gmail', 'smtp')
               ORDER BY ia.schedule_version DESC,ia.created_at DESC LIMIT 1
             ) email ON true
             WHERE spi.proposal_id=$1 AND spi.item_status='confirmed' ORDER BY spi.id
@@ -1022,7 +1044,9 @@ class SchedulingRepository:
                 "attempt": 0,
             },
             "email": {
-                "status": "not_connected" if self.settings.gmail_enabled else "disabled",
+                "status": "not_connected"
+                if self.settings.gmail_enabled and not self.settings.smtp_enabled
+                else "disabled",
                 "error_code": None,
                 "attempt": 0,
             },
@@ -1182,7 +1206,7 @@ class SchedulingRepository:
         company_id: UUID,
         proposal_id: UUID | None,
         interview_id: UUID,
-        provider_account_id: UUID,
+        provider_account_id: UUID | None,
         schedule_version: int,
         correlation_id: UUID,
         kinds: tuple[JobKind, ...],
@@ -1196,19 +1220,25 @@ class SchedulingRepository:
             JobKind.SEND_CANCELLATION: ("gmail", "send_cancellation"),
         }
         for kind in kinds:
-            if kind in {
+            calendar_kind = kind in {
                 JobKind.CREATE_CALENDAR_EVENT,
                 JobKind.UPDATE_CALENDAR_EVENT,
                 JobKind.CANCEL_CALENDAR_EVENT,
-            } and not self.settings.google_calendar_enabled:
+            }
+            if calendar_kind:
+                if not self.settings.google_calendar_enabled or provider_account_id is None:
+                    continue
+                provider, action = mapping[kind]
+                action_account_id = provider_account_id
+            elif self.settings.smtp_enabled:
+                # SMTP actions are system-owned and need no company Google account.
+                provider, action = "smtp", mapping[kind][1]
+                action_account_id = None
+            elif self.settings.gmail_enabled and provider_account_id is not None:
+                provider, action = mapping[kind]
+                action_account_id = provider_account_id
+            else:
                 continue
-            if kind in {
-                JobKind.SEND_INVITATION,
-                JobKind.SEND_RESCHEDULE,
-                JobKind.SEND_CANCELLATION,
-            } and not self.settings.gmail_enabled:
-                continue
-            provider, action = mapping[kind]
             logical_key = f"{kind.value}:{interview_id}:v{schedule_version}"
             action_id = uuid5(NAMESPACE_URL, "talentflow:integration:" + logical_key)
             job_id = uuid5(NAMESPACE_URL, "talentflow:orchestrator-job:" + logical_key)
@@ -1223,7 +1253,7 @@ class SchedulingRepository:
                 action_id,
                 company_id,
                 interview_id,
-                provider_account_id,
+                action_account_id,
                 provider,
                 action,
                 schedule_version,
@@ -1464,17 +1494,16 @@ class SchedulingRepository:
             provider_account_id = await self._provider_account_id(
                 conn, actor.company_id, interview_id
             )
-            if provider_account_id:
-                await self._create_provider_actions(
-                    conn,
-                    company_id=actor.company_id,
-                    proposal_id=None,
-                    interview_id=interview_id,
-                    provider_account_id=provider_account_id,
-                    schedule_version=version,
-                    correlation_id=correlation_id,
-                    kinds=(JobKind.UPDATE_CALENDAR_EVENT, JobKind.SEND_RESCHEDULE),
-                )
+            await self._create_provider_actions(
+                conn,
+                company_id=actor.company_id,
+                proposal_id=None,
+                interview_id=interview_id,
+                provider_account_id=provider_account_id,
+                schedule_version=version,
+                correlation_id=correlation_id,
+                kinds=(JobKind.UPDATE_CALENDAR_EVENT, JobKind.SEND_RESCHEDULE),
+            )
             await self._event(
                 conn,
                 company_id=actor.company_id,
@@ -1684,17 +1713,16 @@ class SchedulingRepository:
             provider_account_id = await self._provider_account_id(
                 conn, actor.company_id, interview_id
             )
-            if provider_account_id:
-                await self._create_provider_actions(
-                    conn,
-                    company_id=actor.company_id,
-                    proposal_id=None,
-                    interview_id=interview_id,
-                    provider_account_id=provider_account_id,
-                    schedule_version=version,
-                    correlation_id=correlation_id,
-                    kinds=(JobKind.CANCEL_CALENDAR_EVENT, JobKind.SEND_CANCELLATION),
-                )
+            await self._create_provider_actions(
+                conn,
+                company_id=actor.company_id,
+                proposal_id=None,
+                interview_id=interview_id,
+                provider_account_id=provider_account_id,
+                schedule_version=version,
+                correlation_id=correlation_id,
+                kinds=(JobKind.CANCEL_CALENDAR_EVENT, JobKind.SEND_CANCELLATION),
+            )
             await self._event(
                 conn,
                 company_id=actor.company_id,
