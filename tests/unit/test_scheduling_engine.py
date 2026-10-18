@@ -16,6 +16,27 @@ from talentflow_orchestrator.scheduling import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _freeze_engine_clock_for_fixed_date_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep fixed-date scheduling scenarios independent of today's date.
+
+    Production still uses the real clock; this fixture affects this test module only.
+    Explicit ``now=`` arguments are preserved.
+    """
+    original_propose = SchedulingEngine.propose
+
+    def propose_with_fixed_now(self, request, policy, busy_intervals=(), **kwargs):
+        if kwargs.get("now") is None:
+            kwargs["now"] = datetime.combine(
+                request.start_date - timedelta(days=1),
+                time(12),
+                tzinfo=UTC,
+            )
+        return original_propose(self, request, policy, busy_intervals, **kwargs)
+
+    monkeypatch.setattr(SchedulingEngine, "propose", propose_with_fixed_now)
+
+
 def request_for(
     candidates: list[UUID],
     *,
